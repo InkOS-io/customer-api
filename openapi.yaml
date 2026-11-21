@@ -1,0 +1,175 @@
+openapi: 3.1.0
+info:
+  title: InkOS Customer API
+  version: 0.1.0-draft
+  description: |
+    Proposed external API for a print or fabrication business to read its own shop records.
+    The relative server path reserves the planned API namespace. Public hosts, credential
+    issuance and sandbox access are pending. Credentials have one shop and named permissions.
+servers:
+  - url: /api/customer/v1
+    description: Proposed relative base path
+security:
+  - ShopBearer: []
+paths:
+  /quotes/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+    get:
+      operationId: getQuoteRevision
+      summary: Read one issued revision and its selling price
+      x-required-scopes: [quotes:read]
+      description: Requires quotes:read. Each revision has its own ID and references a stable series ID.
+      responses:
+        '200':
+          description: Retail quote revision as visible to the shop.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Quote'}}}
+        default: {$ref: '#/components/responses/Error'}
+  /orders/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+    get:
+      operationId: getAcceptedOrder
+      summary: Read the accepted quote reference and order terms
+      x-required-scopes: [orders:read]
+      description: Requires orders:read. The agreed price and quote revision remain fixed across later catalog changes.
+      responses:
+        '200':
+          description: Order visible to the shop.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Order'}}}
+        default: {$ref: '#/components/responses/Error'}
+  /work-orders/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+    get:
+      operationId: getWorkOrder
+      summary: Read a production ticket and its approved and released file references
+      x-required-scopes: [work_orders:read]
+      description: Requires work_orders:read. Process and material names are supplied by the shop.
+      responses:
+        '200':
+          description: Production instructions for the selected work order.
+          content: {application/json: {schema: {$ref: '#/components/schemas/WorkOrder'}}}
+        default: {$ref: '#/components/responses/Error'}
+  /sync:
+    get:
+      operationId: syncChanges
+      summary: Bootstrap or incrementally sync a shop's records in one resource stream
+      description: |
+        The requested resource determines the required scope. Start without a cursor to page
+        through a stable inventory as of a server-selected position. Subsequent pages include
+        changes after that position, including changes that happened during the inventory scan.
+        Pages are ordered within the stream. Multiple entries for a resource ID are allowed.
+        Cursor replay may redeliver entries. Commit nextCursor after processing the entire page.
+        An empty page still supplies a nextCursor. Cursors bind the shop, resource and grants.
+        A cursor for another stream is invalid. A checkpoint beyond retention returns 410.
+        A quote passing its stated expiry is a clock transition and does not emit a sync entry.
+      parameters:
+        - name: resource
+          in: query
+          required: true
+          description: Choose a stream whose matching read permission has been granted.
+          schema: {type: string, enum: [quotes, orders, work_orders]}
+        - name: cursor
+          in: query
+          description: Opaque checkpoint from an earlier page in the same stream.
+          schema: {type: string, minLength: 1}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 100, default: 100}
+      responses:
+        '200':
+          description: Inventory or change page and a resumable checkpoint.
+          content: {application/json: {schema: {$ref: '#/components/schemas/SyncPage'}}}
+        '410': {$ref: '#/components/responses/CheckpointExpired'}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    ShopBearer:
+      type: http
+      scheme: bearer
+      description: Server credential for one shop. Permissions are quotes:read, orders:read and work_orders:read.
+  parameters:
+    Id: {name: id, in: path, required: true, schema: {type: string, minLength: 1}}
+  responses:
+    Error:
+      description: |
+        400 invalid request or stream cursor. 401 missing, expired or invalid token. 403 missing scope.
+        404 resource absent or inaccessible. 429 request throttled. 503 temporarily unavailable.
+      headers:
+        Retry-After: {description: Suggested seconds before another attempt for 429 or 503., schema: {type: integer, minimum: 0}}
+      content: {application/json: {schema: {$ref: '#/components/schemas/Problem'}}}
+    CheckpointExpired:
+      description: Restart the stream without a cursor and reconcile the replacement inventory.
+      content: {application/json: {schema: {$ref: '#/components/schemas/Problem'}}}
+  schemas:
+    Money:
+      type: object
+      required: [currency, amountMinor]
+      properties:
+        currency: {type: string, pattern: '^[A-Z]{3}$', example: CAD}
+        amountMinor: {type: integer, minimum: 0, description: Amount in the currency's minor unit., example: 6600}
+    Quote:
+      type: object
+      required: [id, seriesId, number, revision, title, customer, quantity, price, status, issuedAt, expiresAt]
+      properties:
+        id: {type: string}
+        seriesId: {type: string}
+        number: {type: string, example: Q-0018}
+        revision: {type: integer, minimum: 1}
+        title: {type: string}
+        customer: {type: string}
+        quantity: {type: string, description: Finished quantity as a decimal string., example: '10'}
+        price: {$ref: '#/components/schemas/Money'}
+        status: {type: string, enum: [issued, accepted, superseded, expired]}
+        issuedAt: {type: string, format: date-time}
+        expiresAt: {type: [string, 'null'], format: date-time}
+    Order:
+      type: object
+      required: [id, number, quoteId, quoteRevision, customer, acceptedAt, agreedPrice, status, workOrderIds]
+      properties:
+        id: {type: string}
+        number: {type: string}
+        quoteId: {type: string, description: Accepted quote revision ID.}
+        quoteRevision: {type: integer, minimum: 1}
+        customer: {type: string}
+        acceptedAt: {type: string, format: date-time}
+        agreedPrice: {$ref: '#/components/schemas/Money'}
+        status: {type: string, enum: [accepted, released], description: Released when all required tickets have been released to production.}
+        workOrderIds: {type: array, items: {type: string}}
+    WorkOrder:
+      type: object
+      required: [id, number, orderId, status, process, material, thickness, productionInstructions, approvedRevisionId, releasedRevisionId, updatedAt]
+      properties:
+        id: {type: string}
+        number: {type: string}
+        orderId: {type: string}
+        status: {type: string, enum: [awaiting_proof, approved, released]}
+        process: {type: string, example: CNC routing}
+        material: {type: string, example: Cast acrylic}
+        thickness: {type: string, example: 6 mm}
+        productionInstructions: {type: string}
+        approvedRevisionId: {type: [string, 'null'], description: Exact customer-approved artwork revision.}
+        releasedRevisionId: {type: [string, 'null'], description: Frozen artwork revision for the production handoff.}
+        updatedAt: {type: string, format: date-time}
+    SyncPage:
+      type: object
+      required: [items, nextCursor, hasMore]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [operation, id]
+            properties:
+              operation: {type: string, enum: [upsert, delete]}
+              id: {type: string, description: Stable resource ID within this shop.}
+        nextCursor: {type: string, minLength: 1}
+        hasMore: {type: boolean, description: True while the server has another page available immediately.}
+    Problem:
+      type: object
+      required: [code, message, requestId]
+      properties:
+        code: {type: string}
+        message: {type: string}
+        requestId: {type: string}
